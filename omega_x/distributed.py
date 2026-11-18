@@ -46,6 +46,7 @@ class RemoteWorkerPool:
         self._lock = asyncio.Lock()
         self._unhealthy_until: dict[WorkerEndpoint, float] = {}
         self._last_error: dict[WorkerEndpoint, str] = {}
+        self._last_seen: dict[WorkerEndpoint, float] = {}
 
     async def _select_worker(self) -> WorkerEndpoint:
         async with self._lock:
@@ -87,26 +88,39 @@ class RemoteWorkerPool:
                         0.0, self._unhealthy_until.get(worker, 0.0) - now
                     ),
                     "last_error": self._last_error.get(worker),
+                    "last_seen": self._last_seen.get(worker),
                 }
                 for worker in self.workers
             ]
 
-    async def execute(self, operation: str, inputs: dict):
-        worker = await self._select_worker()
+    async def heartbeat(self, worker: WorkerEndpoint) -> bool:
+        """Ping one worker using the authenticated health RPC."""
+        try:
+            result = await self._execute_on(worker, "__omega_health__", {})
+            if not isinstance(result, dict) or result.get("status") != "ok":
+                raise ConnectionError("Worker returned an invalid heartbeat")
+            async with self._lock:
+                self._unhealthy_until.pop(worker, None)
+                self._last_error.pop(worker, None)
+                self._last_seen[worker] = time.time()
+            return True
+        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+            await self._mark_unhealthy(worker, exc)
+            return False
+
+    async def check_workers(self) -> list[dict]:
+        """Heartbeat every configured worker and return a fresh health snapshot."""
+        await asyncio.gather(*(self.heartbeat(worker) for worker in self.workers))
+        return await self.health_snapshot()
+
+    async def _execute_on(self, worker: WorkerEndpoint, operation: str, inputs: dict):
         writer = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(worker.host, worker.port),
-                timeout=self.timeout,
-            )
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(worker.host, worker.port), timeout=self.timeout)
             request = {"token": worker.token, "operation": operation, "inputs": inputs}
-            payload = (
-                json.dumps(request, separators=(",", ":"), allow_nan=False) + "\n"
-            ).encode()
+            payload = (json.dumps(request, separators=(",", ":"), allow_nan=False) + "\\n").encode()
             if len(payload) > 1_048_576:
-                raise ValueError(
-                    "Remote task request exceeds 1 MiB; pass a CAS reference instead"
-                )
+                raise ValueError("Remote task request exceeds 1 MiB; pass a CAS reference instead")
             writer.write(payload)
             await asyncio.wait_for(writer.drain(), timeout=self.timeout)
             raw = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
@@ -116,9 +130,6 @@ class RemoteWorkerPool:
             if not response.get("ok"):
                 raise RuntimeError(response.get("error", "Remote worker failed"))
             return response.get("value")
-        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
-            await self._mark_unhealthy(worker, exc)
-            raise
         finally:
             if writer is not None:
                 writer.close()
@@ -126,3 +137,15 @@ class RemoteWorkerPool:
                     await writer.wait_closed()
                 except (ConnectionError, OSError):
                     pass
+    async def execute(self, operation: str, inputs: dict):
+        worker = await self._select_worker()
+        try:
+            result = await self._execute_on(worker, operation, inputs)
+            async with self._lock:
+                self._last_seen[worker] = time.time()
+                self._last_error.pop(worker, None)
+                self._unhealthy_until.pop(worker, None)
+            return result
+        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+            await self._mark_unhealthy(worker, exc)
+            raise
