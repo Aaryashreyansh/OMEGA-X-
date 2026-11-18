@@ -48,18 +48,21 @@ async def serve_worker(
                 inputs = request.get("inputs")
                 if not isinstance(operation, str) or not isinstance(inputs, dict):
                     raise ValueError("Request requires operation string and inputs object")
-                async with semaphore:
-                    try:
-                        if storage is not None:
-                            inputs = resolve_cas_references(inputs, storage)
-                        elif any(isinstance(v, dict) and "$cas" in v for v in inputs.values()):
-                            raise ValueError("Worker has no CAS mount configured")
-                        value = await asyncio.to_thread(registry.execute, operation, inputs)
-                        encoded = json.dumps({"ok": True, "value": value},
-                                             separators=(",", ":"), allow_nan=False)
-                        response = json.loads(encoded)
-                    except Exception as exc:
-                        response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if operation == "__omega_health__":
+                    response = {"ok": True, "value": {"status": "ok", "protocol": 1}}
+                else:
+                    async with semaphore:
+                        try:
+                            if storage is not None:
+                                inputs = resolve_cas_references(inputs, storage)
+                            elif any(isinstance(v, dict) and "$cas" in v for v in inputs.values()):
+                                raise ValueError("Worker has no CAS mount configured")
+                            value = await asyncio.to_thread(registry.execute, operation, inputs)
+                            encoded = json.dumps({"ok": True, "value": value},
+                                                 separators=(",", ":"), allow_nan=False)
+                            response = json.loads(encoded)
+                        except Exception as exc:
+                            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             writer.write((json.dumps(response, separators=(",", ":"), allow_nan=False) + "\n").encode())
             await writer.drain()
         except (ValueError, json.JSONDecodeError, asyncio.TimeoutError):
