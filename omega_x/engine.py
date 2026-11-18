@@ -138,14 +138,18 @@ def demo_registry():
         str(value).encode()).hexdigest())
     return registry
 
-async def demo():
+async def demo(state_dir: str | None = None):
     tasks = [
         Task("A", "add", {"a": 100, "b": 50}),
         Task("B", "multiply", {"a": {"from": "A"}, "b": 2}, ("A",)),
         Task("C", "add", {"a": 7, "b": 9}),
         Task("D", "add", {"a": {"from": "B"}, "b": {"from": "C"}}, ("B", "C")),
         Task("E", "sha256_text", {"value": {"from": "D"}}, ("D",))]
-    return await OmegaEngine(tasks, demo_registry(), concurrency=3).execute()
+    engine = OmegaEngine(tasks, demo_registry(), concurrency=3, state_dir=state_dir)
+    try:
+        return await engine.execute()
+    finally:
+        engine.close()
 
 if __name__ == "__main__":
     import json
