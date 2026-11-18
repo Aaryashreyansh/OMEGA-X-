@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import time
 from dataclasses import dataclass
 
 
@@ -14,12 +15,25 @@ class WorkerEndpoint:
 
 
 class RemoteWorkerPool:
-    """Round-robin RPC client for independently running OMEGA-X workers."""
-    def __init__(self, workers: list[WorkerEndpoint], timeout: float = 30.0):
+    """Round-robin RPC client with temporary health-based worker exclusion.
+
+    Transport failures put a worker into cooldown. Application-level errors
+    (for example an unknown operation or rejected token) do not affect health.
+    Workers become eligible again automatically when their cooldown expires.
+    """
+
+    def __init__(
+        self,
+        workers: list[WorkerEndpoint],
+        timeout: float = 30.0,
+        failure_cooldown: float = 5.0,
+    ):
         if not workers:
             raise ValueError("At least one remote worker is required")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if failure_cooldown < 0:
+            raise ValueError("failure_cooldown must be >= 0")
         for worker in workers:
             if not worker.host or not (1 <= worker.port <= 65535):
                 raise ValueError("Invalid worker endpoint")
@@ -27,19 +41,72 @@ class RemoteWorkerPool:
                 raise ValueError("Worker token must contain at least 24 characters")
         self.workers = tuple(workers)
         self.timeout = timeout
+        self.failure_cooldown = failure_cooldown
         self._cycle = itertools.cycle(self.workers)
         self._lock = asyncio.Lock()
+        self._unhealthy_until: dict[WorkerEndpoint, float] = {}
+        self._last_error: dict[WorkerEndpoint, str] = {}
+
+    async def _select_worker(self) -> WorkerEndpoint:
+        async with self._lock:
+            now = time.monotonic()
+            eligible = [
+                worker for worker in self.workers
+                if self._unhealthy_until.get(worker, 0.0) <= now
+            ]
+            if not eligible:
+                # Do not deadlock when every worker is cooling down. Retry the
+                # worker whose cooldown expires first; its connection may recover.
+                earliest = min(self._unhealthy_until.get(w, 0.0) for w in self.workers)
+                eligible = [
+                    worker for worker in self.workers
+                    if self._unhealthy_until.get(worker, 0.0) == earliest
+                ]
+            eligible_ids = {id(worker) for worker in eligible}
+            for _ in range(len(self.workers)):
+                candidate = next(self._cycle)
+                if id(candidate) in eligible_ids:
+                    return candidate
+            return eligible[0]
+
+    async def _mark_unhealthy(self, worker: WorkerEndpoint, exc: Exception) -> None:
+        async with self._lock:
+            self._unhealthy_until[worker] = time.monotonic() + self.failure_cooldown
+            self._last_error[worker] = f"{type(exc).__name__}: {exc}"
+
+    async def health_snapshot(self) -> list[dict]:
+        """Return current worker health without exposing authentication tokens."""
+        async with self._lock:
+            now = time.monotonic()
+            return [
+                {
+                    "host": worker.host,
+                    "port": worker.port,
+                    "healthy": self._unhealthy_until.get(worker, 0.0) <= now,
+                    "cooldown_remaining": max(
+                        0.0, self._unhealthy_until.get(worker, 0.0) - now
+                    ),
+                    "last_error": self._last_error.get(worker),
+                }
+                for worker in self.workers
+            ]
 
     async def execute(self, operation: str, inputs: dict):
-        async with self._lock:
-            worker = next(self._cycle)
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(worker.host, worker.port), timeout=self.timeout)
+        worker = await self._select_worker()
+        writer = None
         try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(worker.host, worker.port),
+                timeout=self.timeout,
+            )
             request = {"token": worker.token, "operation": operation, "inputs": inputs}
-            payload = (json.dumps(request, separators=(",", ":"), allow_nan=False) + "\n").encode()
+            payload = (
+                json.dumps(request, separators=(",", ":"), allow_nan=False) + "\\n"
+            ).encode()
             if len(payload) > 1_048_576:
-                raise ValueError("Remote task request exceeds 1 MiB; pass a CAS reference instead")
+                raise ValueError(
+                    "Remote task request exceeds 1 MiB; pass a CAS reference instead"
+                )
             writer.write(payload)
             await asyncio.wait_for(writer.drain(), timeout=self.timeout)
             raw = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
@@ -49,9 +116,13 @@ class RemoteWorkerPool:
             if not response.get("ok"):
                 raise RuntimeError(response.get("error", "Remote worker failed"))
             return response.get("value")
+        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+            await self._mark_unhealthy(worker, exc)
+            raise
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
