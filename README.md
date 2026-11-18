@@ -1,8 +1,8 @@
 # OMEGA-X TITAN
 
-DAG orchestration with critical-chain scheduling, disk-backed content-addressed storage, persistent task recovery, and an initial remote-worker RPC layer.
+DAG orchestration with critical-chain scheduling, disk-backed content-addressed storage, persistent task recovery, authenticated remote workers, and lazy shared-CAS streaming.
 
-> Engineering prototype. Remote workers use a bearer token over newline-delimited JSON/TCP. Deploy only on a trusted private network/VPN or behind a TLS-terminating proxy. This is not a production-hardened distributed scheduler.
+> Engineering prototype. Remote worker RPC is bounded JSON over TCP with bearer-token authentication. Use a trusted private network/VPN or TLS termination. The shared CAS mode requires the coordinator and each worker to mount the same durable filesystem path.
 
 ## Run tests
 ```bash
@@ -10,50 +10,52 @@ python -m pip install -e ".[dev]"
 pytest -q
 ```
 
-## Run the local demo with persistent state
+## Local demo
 ```bash
 python -m omega_x --state-dir .omega-state
 ```
 
-## Start a remote worker
-On a worker machine, install the repository and set a unique random token (at least 24 characters):
-```bash
-export OMEGA_WORKER_TOKEN='replace-with-a-long-random-secret'
-python -m omega_x.worker --host 0.0.0.0 --port 8765 --concurrency 4
-```
-Bind only to an address reachable inside your private network. Do not expose plain TCP bearer-token traffic to the public internet.
+## Shared CAS worker
+The coordinator and worker must both see the same shared directory (for example, a correctly configured private NFS mount). Set the same path on both machines.
 
-## Connect an engine to remote workers
+Worker:
+```bash
+export OMEGA_WORKER_TOKEN='replace-with-a-random-secret-of-at-least-24-characters'
+export OMEGA_CAS_ROOT='/mnt/omega-shared/cas'
+python -m omega_x.worker --host 10.0.0.12 --port 8765 --cas-root "$OMEGA_CAS_ROOT"
+```
+
+Coordinator example:
 ```python
 import asyncio
-from omega_x.dag import Task
 from omega_x.distributed import RemoteWorkerPool, WorkerEndpoint
-from omega_x.engine import OmegaEngine
 
 async def main():
     pool = RemoteWorkerPool([
-        WorkerEndpoint("10.0.0.12", 8765, "replace-with-the-same-long-random-secret"),
-        WorkerEndpoint("10.0.0.13", 8765, "replace-with-the-same-long-random-secret"),
+        WorkerEndpoint("10.0.0.12", 8765, "replace-with-the-same-secret")
     ])
-    tasks = [Task("sum", "add", {"a": 20, "b": 22})]
-    engine = OmegaEngine(tasks, concurrency=8, worker_pool=pool)
-    print(await engine.execute())
+    # The task payload crossing RPC is a digest reference, not the blob.
+    result = await pool.execute("hash_stream", {
+        "blob": {"$cas": "PUT_THE_64_CHARACTER_SHA256_DIGEST_HERE"}
+    })
+    print(result)
 
 asyncio.run(main())
 ```
 
-The example assumes the worker's registry has the requested operation registered. The built-in CLI worker exposes only the demo operations: `add`, `multiply`, and `sha256_text`.
+A worker operation can receive a lazy `CASBlob` object and iterate `blob.iter_chunks()`. The iterator validates SHA-256 only when fully exhausted. Register the operation in the worker's allowlisted `OperationRegistry`; it is not enabled by default in the demo registry.
 
-## Architecture and limits
-- `omega_x/dag.py`: dependency validation and critical-chain priority.
-- `omega_x/storage.py`: chunked SHA-256 CAS. Fully consume `get()` to complete integrity verification.
-- `omega_x/persistence.py`: SQLite task journal; outputs stored in CAS by digest.
-- `omega_x/worker.py`: bounded authenticated worker server with an explicit operation registry.
-- `omega_x/distributed.py`: round-robin remote worker client.
-- `omega_x/engine.py`: local engine with optional remote worker dispatch.
-- RPC inputs and outputs are JSON-serializable and limited to 1 MiB per request/response line. Large payloads must be staged in shared/object storage and passed as digest references; the current worker protocol does not transfer 1GB payloads.
-- Workers must have compatible operation implementations and access to any referenced shared data.
-- Remote task retries can repeat side effects if a worker completed a task but the response was lost. Make side-effecting operations idempotent.
-- Persistent journal state is local to the coordinator; multi-coordinator leases and distributed consensus are not implemented.
-- Use TLS/VPN for network confidentiality. The bearer token alone does not encrypt traffic.
-- A thread-backed operation may continue after its asyncio timeout.
+## CAS reference protocol
+- The wire marker is exactly `{"$cas": "<sha256-digest>"}`.
+- The worker resolves it to a lazy `CASBlob`; payload bytes are not serialized into RPC.
+- The coordinator must place the blob in shared CAS before dispatch.
+- The shared filesystem must provide durable, coherent file visibility across hosts. Local disk paths on different machines are not shared storage.
+- Current RPC messages remain limited to 1 MiB. Large data stays in CAS and only small JSON metadata/digests cross the network.
+- Stream consumers must exhaust the iterator to complete digest verification.
+
+## Security and reliability limits
+- Bearer-token TCP is not encrypted. Use VPN/private networking or TLS.
+- Worker operation registry is an allowlist; do not register arbitrary code execution.
+- Side effects may repeat after a lost response; design operations to be idempotent.
+- The task journal is coordinator-local. Distributed leases, consensus, and multi-coordinator recovery are not implemented.
+- This prototype does not claim production readiness or validated 1GB throughput. Benchmark on the target shared filesystem before setting capacity expectations.
