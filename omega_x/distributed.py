@@ -101,7 +101,7 @@ class RemoteWorkerPool:
             )
             request = {"token": worker.token, "operation": operation, "inputs": inputs}
             payload = (
-                json.dumps(request, separators=(",", ":"), allow_nan=False) + "\\n"
+                json.dumps(request, separators=(",", ":"), allow_nan=False) + "\n"
             ).encode()
             if len(payload) > 1_048_576:
                 raise ValueError(
