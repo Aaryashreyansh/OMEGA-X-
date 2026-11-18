@@ -76,3 +76,8 @@ async def test_engine_retries_failed_worker_and_fails_over_to_next_worker():
         assert report["results"]["retry"]["value"] == 42
         assert report["results"]["retry"]["attempts"] == 2
         assert report["summary"]["completed"] == 1
+
+        health = await pool.health_snapshot()
+        assert health[0]["healthy"] is False
+        assert health[0]["last_error"] is not None
+        assert health[1]["healthy"] is True
