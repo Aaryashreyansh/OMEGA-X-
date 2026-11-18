@@ -47,3 +47,32 @@ async def test_engine_can_dispatch_tasks_to_remote_worker():
         report = await engine.execute()
         assert report["results"]["B"]["value"] == 42
         assert report["summary"]["completed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_engine_retries_failed_worker_and_fails_over_to_next_worker():
+    import socket
+
+    # Reserve then release a local port to create a deterministic unavailable endpoint.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        unavailable_port = sock.getsockname()[1]
+
+    registry = OperationRegistry()
+    registry.register("sum", lambda a, b: a + b)
+    server = await serve_worker(registry, TOKEN, "127.0.0.1", 0, 2)
+    healthy_port = server.sockets[0].getsockname()[1]
+
+    async with server:
+        pool = RemoteWorkerPool([
+            WorkerEndpoint("127.0.0.1", unavailable_port, TOKEN),
+            WorkerEndpoint("127.0.0.1", healthy_port, TOKEN),
+        ])
+        task = Task("retry", "sum", {"a": 20, "b": 22}, retries=1)
+        engine = OmegaEngine([task], concurrency=1, worker_pool=pool)
+        report = await engine.execute()
+
+        assert report["results"]["retry"]["status"] == "SUCCESS"
+        assert report["results"]["retry"]["value"] == 42
+        assert report["results"]["retry"]["attempts"] == 2
+        assert report["summary"]["completed"] == 1
