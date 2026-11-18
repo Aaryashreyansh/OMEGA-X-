@@ -104,7 +104,7 @@ class RemoteWorkerPool:
                 self._last_error.pop(worker, None)
                 self._last_seen[worker] = time.time()
             return True
-        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+        except (OSError, asyncio.TimeoutError, ConnectionError, json.JSONDecodeError, RuntimeError) as exc:
             await self._mark_unhealthy(worker, exc)
             return False
 
