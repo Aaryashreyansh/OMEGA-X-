@@ -8,7 +8,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .dag import Task
-from .engine import TaskResult
 from .storage import ContentAddressedStorage
 
 
@@ -46,7 +45,8 @@ class ExecutionJournal:
                              allow_nan=False).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def restore(self, tasks: dict[str, Task]) -> dict[str, TaskResult]:
+    def restore(self, tasks: dict[str, Task]):
+        from .engine import TaskResult
         restored: dict[str, TaskResult] = {}
         with self._lock:
             rows = self._db.execute(
