@@ -81,3 +81,31 @@ async def test_engine_retries_failed_worker_and_fails_over_to_next_worker():
         assert health[0]["healthy"] is False
         assert health[0]["last_error"] is not None
         assert health[1]["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_reports_healthy_and_updates_last_seen():
+    registry = OperationRegistry()
+    server = await serve_worker(registry, TOKEN, "127.0.0.1", 0, 2)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        worker = WorkerEndpoint("127.0.0.1", port, TOKEN)
+        pool = RemoteWorkerPool([worker])
+        rows = await pool.check_workers()
+        assert rows[0]["healthy"] is True
+        assert rows[0]["last_seen"] is not None
+        assert rows[0]["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_marks_unreachable_worker_unhealthy():
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    worker = WorkerEndpoint("127.0.0.1", port, TOKEN)
+    pool = RemoteWorkerPool([worker], timeout=0.2, failure_cooldown=2)
+    rows = await pool.check_workers()
+    assert rows[0]["healthy"] is False
+    assert rows[0]["last_error"] is not None
