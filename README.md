@@ -1,46 +1,87 @@
 # OMEGA-X TITAN
 
-DAG task orchestration with critical-chain scheduling, disk-backed SHA-256 content-addressed storage, and an optional persistent execution journal.
+DAG orchestration with critical-chain scheduling, disk-backed content-addressed storage, persistent task recovery, authenticated remote workers, and lazy shared-CAS streaming.
 
-> Engineering prototype. Persistent single-process recovery and JSON-compatible output caching are implemented as an initial V2 milestone. Distributed workers, multi-process locking, end-to-end streaming task transforms, and production-scale benchmarks are not implemented or claimed.
+> Engineering prototype. Remote worker RPC is bounded JSON over TCP with bearer-token authentication. Use a trusted private network/VPN or TLS termination. The shared CAS mode requires the coordinator and each worker to mount the same durable filesystem path.
 
-## Requirements
-- Python 3.11+
-- Runtime uses the Python standard library
-- Tests use pytest and pytest-asyncio
-
-## Run in GitHub Codespaces
+## Run tests
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python -m omega_x --state-dir .omega-state
 pytest -q
 ```
 
-The default state directory is `.omega-state`. Re-running the same unchanged task graph restores successful task outputs from CAS and skips those tasks. Use a fresh state directory when intentionally changing task definitions, for example `--state-dir .omega-state-new`.
+## Local demo
+```bash
+python -m omega_x --state-dir .omega-state
+```
 
-## Modules
-- `omega_x/storage.py`: disk CAS; SQLite stores object keys and digests, not payload bytes.
-- `omega_x/persistence.py`: SQLite task journal; successful JSON-compatible outputs are stored in CAS and referenced by digest.
-- `omega_x/dag.py`: DAG validation, longest downstream chain priority, deterministic `asyncio.PriorityQueue`.
-- `omega_x/engine.py`: bounded async execution, retries, dependency failure propagation, and optional persistent recovery.
-- `omega_x/verify.py`: independent report consistency checks.
+## Shared CAS worker
+The coordinator and worker must both see the same shared directory (for example, a correctly configured private NFS mount). Set the same path on both machines.
 
-## Recovery contract
-- A task is marked `RUNNING` before its worker starts.
-- A successful output is written to CAS before its journal row is committed as `SUCCESS`.
-- On restart, `SUCCESS` outputs are restored from CAS and are not re-executed.
-- A task left `RUNNING` by an interrupted process is reset to `PENDING` and may run again.
-- Task definitions are fingerprinted. Changing a task while reusing the same state directory raises an error instead of silently reusing stale output.
-- Successful outputs in persistent mode must be JSON-serializable.
-- Exactly-once side effects are not guaranteed: an interrupted task may have completed an external side effect before its success was journaled. Operations with external side effects should be idempotent.
+Worker:
+```bash
+export OMEGA_WORKER_TOKEN='replace-with-a-random-secret-of-at-least-24-characters'
+export OMEGA_CAS_ROOT='/mnt/omega-shared/cas'
+python -m omega_x.worker --host 10.0.0.12 --port 8765 --cas-root "$OMEGA_CAS_ROOT"
+```
 
-## Streaming integrity contract
-`ContentAddressedStorage.put(chunks)` consumes byte chunks. `get(digest)` yields chunks and verifies SHA-256 only after the iterator is fully exhausted. A consumer must finish iteration before treating the payload as verified. Use `get()` for streaming; `get_json()` is only for small structured values.
+Coordinator example:
+```python
+import asyncio
+from omega_x.distributed import RemoteWorkerPool, WorkerEndpoint
 
-## Current limitations
-- The journal's SQLite lock is process-local; multi-process and distributed coordination need a separate locking/lease design.
-- A timed-out thread-backed Python operation may continue running because Python cannot forcibly stop that thread.
-- The engine currently passes dependency values as Python objects; end-to-end streaming task transforms are a planned extension.
-- No claim of distributed execution, 1GB+ end-to-end processing, or production readiness is made without dedicated tests and measurements.
+async def main():
+    pool = RemoteWorkerPool([
+        WorkerEndpoint("10.0.0.12", 8765, "replace-with-the-same-secret")
+    ])
+    # The task payload crossing RPC is a digest reference, not the blob.
+    result = await pool.execute("hash_stream", {
+        "blob": {"$cas": "PUT_THE_64_CHARACTER_SHA256_DIGEST_HERE"}
+    })
+    print(result)
+
+asyncio.run(main())
+```
+
+A worker operation can receive a lazy `CASBlob` object and iterate `blob.iter_chunks()`. The iterator validates SHA-256 only when fully exhausted. Register the operation in the worker's allowlisted `OperationRegistry`; it is not enabled by default in the demo registry.
+
+## CAS reference protocol
+- The wire marker is exactly `{"$cas": "<sha256-digest>"}`.
+- The worker resolves it to a lazy `CASBlob`; payload bytes are not serialized into RPC.
+- The coordinator must place the blob in shared CAS before dispatch.
+- The shared filesystem must provide durable, coherent file visibility across hosts. Local disk paths on different machines are not shared storage.
+- Current RPC messages remain limited to 1 MiB. Large data stays in CAS and only small JSON metadata/digests cross the network.
+- Stream consumers must exhaust the iterator to complete digest verification.
+
+## Security and reliability limits
+- Bearer-token TCP is not encrypted. Use VPN/private networking or TLS.
+- Worker operation registry is an allowlist; do not register arbitrary code execution.
+- Side effects may repeat after a lost response; design operations to be idempotent.
+- The task journal is coordinator-local. Distributed leases, consensus, and multi-coordinator recovery are not implemented.
+- This prototype does not claim production readiness or validated 1GB throughput. Benchmark on the target shared filesystem before setting capacity expectations.
+
+## CAS streaming benchmark
+Run a synthetic 1 GiB benchmark (requires enough free disk space; generated incrementally, not held in RAM):
+```bash
+python benchmarks/cas_stream_benchmark.py --size-mib 1024 --chunks-kib 64 256 1024 4096
+```
+For a quick smoke benchmark use `--size-mib 32 --chunks-kib 64 256`. The script reports write/read MiB/s, Python-traced peak allocation, and digest verification. Results are hardware/filesystem-specific; do not treat one run as a production capacity guarantee. Benchmark cases use separate temporary CAS directories and clean them up afterward.
+
+
+## Live worker health dashboard
+
+Workers expose an authenticated `__omega_health__` heartbeat RPC. The coordinator records the last successful heartbeat, marks transport failures unhealthy, and automatically makes a worker eligible again after its cooldown.
+
+Configure a shared worker token and comma-separated endpoints:
+```bash
+export OMEGA_WORKER_TOKEN='replace-with-a-random-secret-of-at-least-24-characters'
+export OMEGA_WORKERS='127.0.0.1:8765,10.0.0.12:8765'
+python -m omega_x.monitor --interval 5
+```
+
+Run one scan and exit:
+```bash
+python -m omega_x.monitor --once
+```
+
+The dashboard is a terminal monitor, not a web UI. It never prints authentication tokens. Keep worker RPC on a trusted private network or behind TLS/VPN.
