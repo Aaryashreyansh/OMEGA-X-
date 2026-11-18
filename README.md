@@ -66,3 +66,22 @@ Run a synthetic 1 GiB benchmark (requires enough free disk space; generated incr
 python benchmarks/cas_stream_benchmark.py --size-mib 1024 --chunks-kib 64 256 1024 4096
 ```
 For a quick smoke benchmark use `--size-mib 32 --chunks-kib 64 256`. The script reports write/read MiB/s, Python-traced peak allocation, and digest verification. Results are hardware/filesystem-specific; do not treat one run as a production capacity guarantee. Benchmark cases use separate temporary CAS directories and clean them up afterward.
+
+
+## Live worker health dashboard
+
+Workers expose an authenticated `__omega_health__` heartbeat RPC. The coordinator records the last successful heartbeat, marks transport failures unhealthy, and automatically makes a worker eligible again after its cooldown.
+
+Configure a shared worker token and comma-separated endpoints:
+```bash
+export OMEGA_WORKER_TOKEN='replace-with-a-random-secret-of-at-least-24-characters'
+export OMEGA_WORKERS='127.0.0.1:8765,10.0.0.12:8765'
+python -m omega_x.monitor --interval 5
+```
+
+Run one scan and exit:
+```bash
+python -m omega_x.monitor --once
+```
+
+The dashboard is a terminal monitor, not a web UI. It never prints authentication tokens. Keep worker RPC on a trusted private network or behind TLS/VPN.
