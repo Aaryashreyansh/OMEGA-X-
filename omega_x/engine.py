@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Any, Callable
 from .dag import Task, DependencyGraph, AdvancedDAGScheduler, ReadyQueue
+from .persistence import ExecutionJournal
 
 class OperationRegistry:
     def __init__(self):
@@ -28,7 +29,7 @@ class TaskResult:
 
 class OmegaEngine:
     def __init__(self, tasks: list[Task], registry: OperationRegistry | None = None,
-                 concurrency: int = 4):
+                 concurrency: int = 4, state_dir: str | None = None):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
         self.graph = DependencyGraph(tasks)
@@ -36,6 +37,7 @@ class OmegaEngine:
         self.registry = registry or OperationRegistry()
         self.concurrency = concurrency
         self.results: dict[str, TaskResult] = {}
+        self.journal = ExecutionJournal(state_dir) if state_dir else None
 
     def _resolve(self, inputs: dict) -> dict:
         resolved = {}
@@ -69,8 +71,11 @@ class OmegaEngine:
                           duration=time.perf_counter() - start)
 
     async def execute(self):
-        pending = set(self.graph.tasks)
-        failed = set()
+        if self.journal:
+            self.results.update(self.journal.restore(self.graph.tasks))
+        pending = set(self.graph.tasks) - set(self.results)
+        failed = {tid for tid, result in self.results.items()
+                  if result.status in {"FAILED", "BLOCKED"}}
         running = {}
         ready = ReadyQueue(self.scheduler)
         while pending or running:
@@ -80,8 +85,10 @@ class OmegaEngine:
                 for tid in list(pending):
                     task = self.graph.tasks[tid]
                     if any(dep in failed for dep in task.dependencies):
-                        self.results[tid] = TaskResult(tid, "BLOCKED",
-                                                       error="Dependency failed")
+                        result = TaskResult(tid, "BLOCKED", error="Dependency failed")
+                        self.results[tid] = result
+                        if self.journal:
+                            self.journal.save_result(task, result)
                         pending.remove(tid)
                         failed.add(tid)
                         changed = True
@@ -93,6 +100,8 @@ class OmegaEngine:
                         pending.remove(tid)
             while ready.qsize() and len(running) < self.concurrency:
                 task = await ready.get()
+                if self.journal:
+                    self.journal.mark_running(task)
                 future = asyncio.create_task(self._execute_one(task))
                 running[future] = task.id
                 ready.task_done()
@@ -105,6 +114,8 @@ class OmegaEngine:
                 tid = running.pop(future)
                 result = future.result()
                 self.results[tid] = result
+                if self.journal:
+                    self.journal.save_result(self.graph.tasks[tid], result)
                 if result.status != "SUCCESS":
                     failed.add(tid)
         return {
@@ -114,6 +125,10 @@ class OmegaEngine:
                 "failed": sum(r.status == "FAILED" for r in self.results.values()),
                 "blocked": sum(r.status == "BLOCKED" for r in self.results.values())},
             "results": {key: asdict(value) for key, value in self.results.items()}}
+
+    def close(self):
+        if self.journal:
+            self.journal.close()
 
 def demo_registry():
     registry = OperationRegistry()
