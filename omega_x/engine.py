@@ -29,13 +29,14 @@ class TaskResult:
 
 class OmegaEngine:
     def __init__(self, tasks: list[Task], registry: OperationRegistry | None = None,
-                 concurrency: int = 4, state_dir: str | None = None):
+                 concurrency: int = 4, state_dir: str | None = None, worker_pool=None):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
         self.graph = DependencyGraph(tasks)
         self.scheduler = AdvancedDAGScheduler(self.graph)
         self.registry = registry or OperationRegistry()
         self.concurrency = concurrency
+        self.worker_pool = worker_pool
         self.results: dict[str, TaskResult] = {}
         self.journal = ExecutionJournal(state_dir) if state_dir else None
 
@@ -58,9 +59,13 @@ class OmegaEngine:
         for attempt in range(1, task.retries + 2):
             try:
                 args = self._resolve(task.inputs)
-                value = await asyncio.wait_for(
-                    asyncio.to_thread(self.registry.execute, task.operation, args),
-                    timeout=task.timeout)
+                if self.worker_pool is not None:
+                    value = await asyncio.wait_for(
+                        self.worker_pool.execute(task.operation, args), timeout=task.timeout)
+                else:
+                    value = await asyncio.wait_for(
+                        asyncio.to_thread(self.registry.execute, task.operation, args),
+                        timeout=task.timeout)
                 return TaskResult(task.id, "SUCCESS", value=value, attempts=attempt,
                                   duration=time.perf_counter() - start)
             except Exception as exc:
