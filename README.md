@@ -59,3 +59,10 @@ A worker operation can receive a lazy `CASBlob` object and iterate `blob.iter_ch
 - Side effects may repeat after a lost response; design operations to be idempotent.
 - The task journal is coordinator-local. Distributed leases, consensus, and multi-coordinator recovery are not implemented.
 - This prototype does not claim production readiness or validated 1GB throughput. Benchmark on the target shared filesystem before setting capacity expectations.
+
+## CAS streaming benchmark
+Run a synthetic 1 GiB benchmark (requires enough free disk space; generated incrementally, not held in RAM):
+```bash
+python benchmarks/cas_stream_benchmark.py --size-mib 1024 --chunks-kib 64 256 1024 4096
+```
+For a quick smoke benchmark use `--size-mib 32 --chunks-kib 64 256`. The script reports write/read MiB/s, Python-traced peak allocation, and digest verification. Results are hardware/filesystem-specific; do not treat one run as a production capacity guarantee. Benchmark cases use separate temporary CAS directories and clean them up afterward.
