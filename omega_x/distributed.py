@@ -118,7 +118,7 @@ class RemoteWorkerPool:
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(worker.host, worker.port), timeout=self.timeout)
             request = {"token": worker.token, "operation": operation, "inputs": inputs}
-            payload = (json.dumps(request, separators=(",", ":"), allow_nan=False) + "\\n").encode()
+            payload = (json.dumps(request, separators=(",", ":"), allow_nan=False) + "\n").encode()
             if len(payload) > 1_048_576:
                 raise ValueError("Remote task request exceeds 1 MiB; pass a CAS reference instead")
             writer.write(payload)
